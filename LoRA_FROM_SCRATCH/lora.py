@@ -20,11 +20,11 @@ class LoRALayerBase:
         self.lora_alpha = lora_alpha
         
         # Scaling factor
-        # Scaling factor = lora_alph/rank 
+        # Scaling factor = lora_alpha /rank 
         
         if use_rslora:
             # RS-LoRA: alpha / sqrt(rank)
-            self.scaling = self.lora_alph/(self.rank ** 0.5)
+            self.scaling = self.lora_alpha/(self.rank ** 0.5)
         else:
             self.scaling = self.lora_alpha/self.rank
             
@@ -42,7 +42,7 @@ class LoRALinear(nn.Linear, LoRALayerBase):
     nn.Linear를 상속받았으므로, 기존 Linear Layer처럼 동작하면서 LoRA 기능이 추가됩니다.
     """
 
-    def __init__(self,in_features,out_features,bias=True,rank=8,lora_ahpha=8,lora_dropout=0.0, use_rslora=True,**kwargs):
+    def __init__(self,in_features,out_features,bias=True,rank=8,lora_alpha=8,lora_dropout=0.0, use_rslora=True,**kwargs):
         """
             in_features: 입력의 차원
             out_features: 출력의 차원
@@ -148,6 +148,89 @@ class LoRAModel(nn.Module):
         #3. 교체된 후, 학습 가능한 파라미터 수 확인 (디버깅용)
         self._print_trainable_parameters()
     
-
-
+    def _apply_lora(self):
+        """
+        모델의 모든 모듈을 순회하면서,
+        target_modules에 해당하는 모듈을 LoRA 레이어로 교체합니다.
         
+        1. 모델의 모든 모듈을 순회
+        2. 모듈 이름과 타입 확인
+        3. target_modules에 해당하면 LoRALinear로 교체
+        4. 교체된 모듈을 모델에 다시 할당
+        """
+        self._replace_modules(self.model)
+    
+    def _replace_modules(self, module):
+        # module의 자식들을 순회합니다
+        # 여기서 module은 self.model이 될 수도 있고, 그 하위 모듈이 될 수도 있습니다.
+        
+        # module의 자식들을 순회합니다.
+        for name, child in module.named_children():
+            
+            # 1. 만약 자식이 또 자식을 가지고 있다면 -> 재귀호출!
+            # ps: named_chidren(): 직계 자식만 보기 vs 모든 자손보기 named_modules()
+            
+            if len(list(child.children())) > 0:
+                self._replace_modules(child)
+                
+            # 2. 자식이 Linear 레이어, 이름이 타겟에포함된다면? -> 교체!!
+            if isinstance(child, nn.Linear) and any(t in name for t in self.target_modules):
+
+                """
+                LoRA: Low-Rank Adaptation of Large Language Models에 의하면
+                target 모듈은 주로 Qurey랑 Value가 제일 좋았다고 한다
+                #   - Q만 LoRA 적용
+                #   - K만 LoRA 적용
+                #   - V만 LoRA 적용
+                #   - Q+V LoRA 적용
+                #   - 전체 W LoRA 적용
+                
+                # 실험 결론:
+                #   Q+V 조합이 "파라미터 수 대비 성능 향상"이 가장 컸음.
+                #   모든 W를 학습시키면 성능은 더 좋지만,
+                #   파라미터가 너무 많아져서 LoRA 효율성이 사라짐.
+                #   즉, Q+V = 최적의 sweet spot (가성비 최고)
+                
+                # 나의 질문 Qurey는 사용자입력과 연관되어있는데? : 사실은 어떻게 입력을 해석할지에 핵심이였다!!
+                Query : 해석법
+                Value : 해석법에 따른 값 사과를 보고 apple일지 apolization일지
+                """
+                
+                #1. 새 LoRALinear를 생성한다
+                new_layer = LoRALinear(
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    rank=self.rank,
+                    lora_alpha=self.lora_alpha,
+                    lora_dropout=self.lora_dropout,
+                )
+                
+                
+                # 2. 가중치 복사 (기존 학습된값 복사)
+                new_layer.weight.data = child.weight.data
+                if child.bias  is not None:
+                    new_layer.bias.data = child.bias.data
+                    
+                    
+                # 3. 핵심 of 핵심 교체를 한다
+                """
+                기존의 linear layer 였던것이 이제는 LoRALinear로 교체된다
+                """
+                setattr(module, name, new_layer)
+                
+                
+                print(f"LoRA Layer 적용 완료!")
+            
+    def forward(self,x):
+        return self.model(x)
+    
+    
+    def _print_trainable_parameters(self):
+        trainable_params = 0
+        all_param = 0
+        for _, param in self.model.named_parameters():
+            all_param += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+        print(f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}%")
