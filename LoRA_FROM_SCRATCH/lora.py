@@ -2,6 +2,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from dataclasses import dataclass
+from typing import List, Optional, Union
+
+
+#dataclass를 사용하면 구조체처럼 쓸수있다! init 부터 이런거
+@dataclass
+class LoraConfig:
+    rank: int = 8
+    lora_alpha : float = 8.0
+    target_modules: Optional[List[str]] = None
+    lora_dropout : float = 0.0
+    use_rslora : bool = True
+    
+    def __post_init__(self):
+        """
+        LoraConfig 필드의 후처리 초기화.
+        Mutable default argument 문제를 우회하여 target_modules의 
+        기본값을 ["query", "value"]로 설정합니다.
+        """
+        if self.target_modules is None:
+            self.target_modules = ["query", "value"]
+
+        if self.user_rslora:
+            self.scaling = self.lora_alpha/ (self.rank **0.5)
+        else:
+            self.scaling = self.lora_alpha/ self.rank
 
 class LoRALayerBase:
     '''
@@ -13,16 +39,16 @@ class LoRALayerBase:
         lora_dropout (float): LoRA의 dropout
     
     
-    
     '''
-    def __init__(self, rank=8, lora_alpha =8, lora_dropout=0.0, use_rslora=True):
-        self.rank = rank
-        self.lora_alpha = lora_alpha
+    def __init__(self, config : LoraConfig):
+        self.rank = config.rank
+        self.lora_alpha = config.lora_alpha
+        self.use_rslora = config.use_rslora
         
         # Scaling factor
         # Scaling factor = lora_alpha /rank 
         
-        if use_rslora:
+        if self.use_rslora:
             # RS-LoRA: alpha / sqrt(rank)
             self.scaling = self.lora_alpha/(self.rank ** 0.5)
         else:
@@ -30,19 +56,30 @@ class LoRALayerBase:
             
             
         # 드롭 아웃 설정
-        if lora_dropout > 0.0:
-            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        if config.lora_dropout > 0.0:
+            self.lora_dropout = nn.Dropout(p=config.lora_dropout)
         else:
             self.lora_dropout = lambda x:x
+        
+        self.merged =False
             
-
+    def merge_weights(self):
+        if self.merged:
+            print("이미 병합되었습니다")
+            return
+        self.merge_implementation()
+        self.merged = True
+    
+    def _merge_implementation(self):
+        raise NotImplementedError("서브 클래스에서 구현해야 합니다.")
+    
 class LoRALinear(nn.Linear, LoRALayerBase):
     """
     LoRA가 적용된 Linear Layer입니다.
     nn.Linear를 상속받았으므로, 기존 Linear Layer처럼 동작하면서 LoRA 기능이 추가됩니다.
     """
 
-    def __init__(self,in_features,out_features,bias=True,rank=8,lora_alpha=8,lora_dropout=0.0, use_rslora=True,**kwargs):
+    def __init__(self, in_features, out_features, config: LoraConfig, bias=True, **kwargs):
         """
             in_features: 입력의 차원
             out_features: 출력의 차원
@@ -55,7 +92,7 @@ class LoRALinear(nn.Linear, LoRALayerBase):
     
         # 1. 부모 클래스 인 nn.Linear와 LoRALayerBase초기화
         nn.Linear.__init__(self, in_features, out_features, bias=bias, **kwargs)
-        LoRALayerBase.__init__(self, rank=rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout, use_rslora=use_rslora)
+        LoRALayerBase.__init__(self, config)
         """
             **kwargs는 Python의 가변 키워드 인자(Variable Keyword Arguments)입니다!
         """
@@ -74,20 +111,27 @@ class LoRALinear(nn.Linear, LoRALayerBase):
         # del(W) = (A @ B) * scaling
         # A와 B는 학습 가능한 파라미터(nn.Parameter)여야 합니다.
         
-        self.lora_A = nn.Parameter(torch.zeros(in_features, rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, out_features))
+        self.lora_A = nn.Parameter(torch.zeros(in_features, self.rank))
+        self.lora_B = nn.Parameter(torch.zeros(self.rank, out_features))
         
-        
-        # 논문에 따르면 A는 랜덤 initialization을 B는 0으로 초기화한다
-        
+        self.reset_lora_parameters()
+
+    def reset_lora_parameters(self):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
-        
+        # 논문에 따르면 A는 랜덤 initialization을 B는 0으로 초기화한다        
         """
         kaiming_uniform_ : He init 방법을 사용하여 초기화
         """
-        
-        
+    
+    
+    """
+    수식: weight += (A @ B).T * scaling
+    """
+    def _merge_implementation(self):
+        self.weight +=(self.lora_A @ self.lora_B).T * self.scaling        
+    
+    
     def forward(self,x):
         
         """
@@ -115,7 +159,7 @@ class LoRALinear(nn.Linear, LoRALayerBase):
         
         return original_output + lora_output
     
-    
+
 class LoRAModel(nn.Module):
     """
     기존 모델(예: BERT, Roberta 등)을 감싸서 LoRA를 적용하는 Wrapper 클래스입니다.
