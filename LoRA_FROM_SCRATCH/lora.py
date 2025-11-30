@@ -159,7 +159,43 @@ class LoRALinear(nn.Linear, LoRALayerBase):
         
         return original_output + lora_output
     
+class LoRAEmbedding(nn.Embedding, LoRALayerBase):
+    def __init__(self, num_embeddings, embedding_dim, config: LoraConfig, **kwargs):
+        nn.Embedding.__init__(self, num_embeddings, embedding_dim, **kwargs)
+        LoRALayerBase.__init__(self, config)
 
+        # 1. LoRA 행렬 정의
+        self.lora_A = nn.Parameter(torch.zeros(num_embeddings, self.rank))
+        self.lora_B = nn.Parameter(torch.zeros(self.rank, embedding_dim))
+        
+        # 2. 초기화
+        # lora_A는 kaming_uniform_으로 초기화
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # lora_B는 0으로 초기화
+        nn.init.zeros_(self.lora_B)
+        
+    def _merge_implementation(self):
+        # 임베딩은 Transpose 하지 않습니다
+        self.weight.data += (self.lora_A @ self.lora_B) * self.scaling
+        
+    def forward(self,x):
+        # 1. 원래 임베딩
+        result = nn.Embedding.forward(self,x)
+        
+        if self.merged:
+            return result
+        
+        # 2. LoRA 계산
+        # x는 인덱스이므로 행렬곱(@) 대신 embedding lookup을 해야 합니다.
+        # (Batch, Seq) -> (Batch, Seq, Rank)
+        after_A = F.embedding(x, self.lora_A)
+        
+        # (Batch, Seq, Rank) @ (Rank, Dim) -> (Batch, Seq, Dim)
+        result += (after_A @ self.lora_B) * self.scaling
+        
+        return result
+    
+    
 class LoRAModel(nn.Module):
     """
     기존 모델(예: BERT, Roberta 등)을 감싸서 LoRA를 적용하는 Wrapper 클래스입니다.
